@@ -1,0 +1,9 @@
+{
+  "id": "git-deeplink",
+  "name": "Git DeepLink",
+  "version": "1.0.0",
+  "minAppVersion": "0.15.0",
+  "description": "Allows using obsidian://git-deeplink to link to obsidian files in a specific git branch.",
+  "author": "Reinaldo Arrosi",
+  "isDesktopOnly": true
+}

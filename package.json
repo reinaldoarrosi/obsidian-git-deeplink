@@ -1,0 +1,7 @@
+{
+  "name": "obsidian-git-deeplink",
+  "version": "1.0.0",
+  "description": "Obsidian plugin to bridge deep links with local Git branch management.",
+  "main": "main.js",
+  "license": "MIT"
+}
