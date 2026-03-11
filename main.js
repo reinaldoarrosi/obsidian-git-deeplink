@@ -40,7 +40,7 @@ function waitForFile(app, filePath, intervalMs = 300, timeoutMs = 5000) {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-//  Branch picker modal (fuzzy-searchable list)
+//  Branch picker modal (fuzzy-searchable list with async loading)
 // ══════════════════════════════════════════════════════════════════════
 class BranchSuggestModal extends FuzzySuggestModal {
   constructor(app, branches, onChoose) {
@@ -48,27 +48,51 @@ class BranchSuggestModal extends FuzzySuggestModal {
     this.branches = branches;
     this.onChoose = onChoose;
     this.resolved = false;
-    this.setPlaceholder("Type to search branches…");
+    this.loading = true;
+    this.setPlaceholder("Loading branches…");
   }
 
   getItems() {
+    if (this.loading && this.branches.length === 0) {
+      // Return a disabled sentinel item while loading with no branches yet
+      return [{ display: "Loading branches…", ref: null, type: "loading" }];
+    }
     return this.branches;
   }
 
   getItemText(item) {
+    if (item.type === "loading") return item.display;
     return `${item.display}  [${item.type}]`;
   }
 
   onChooseItem(item) {
+    if (item.type === "loading") return; // ignore clicks on the loading sentinel
     this.resolved = true;
     this.onChoose(item);
   }
 
   onClose() {
-    // If the user dismissed without picking, resolve with null
-    if (!this.resolved) {
-      this.onChoose(null);
+    // onClose fires BEFORE onChooseItem in Obsidian, so we defer
+    // the dismissal check to give onChooseItem a chance to run first.
+    setTimeout(() => {
+      if (!this.resolved) {
+        this.onChoose(null);
+      }
+    }, 50);
+  }
+
+  /**
+   * Replace the branch list and refresh the rendered suggestions.
+   */
+  updateBranches(branches, loading) {
+    this.branches = branches;
+    this.loading = loading;
+    if (!loading) {
+      this.setPlaceholder("Type to search branches…");
     }
+    // Re-render the suggestion list so the user sees the update immediately.
+    // FuzzySuggestModal stores the current query in this.inputEl.
+    this.updateSuggestions();
   }
 }
 
@@ -108,8 +132,8 @@ class GitDeepLinkPlugin extends Plugin {
 
     // ── Feature 3: "Git: Checkout branch" command ──────────────────────
     this.addCommand({
-      id: "git-checkout-branch",
-      name: "Git: Checkout branch",
+      id: "git-deeplink-checkout-branch",
+      name: "Checkout branch",
       callback: async () => {
         await this.checkoutBranchFromPalette();
       },
@@ -125,6 +149,46 @@ class GitDeepLinkPlugin extends Plugin {
   clearStatus() {
     this.statusBarItem.setText("");
     this.statusBarItem.style.display = "none";
+  }
+
+  // ── Refresh obsidian-git status after branch changes ───────────────
+  // obsidian-git only updates its branch status bar in response to its
+  // own operations.  After we checkout a branch externally we need to
+  // poke it so the UI stays in sync.
+  async refreshObsidianGit() {
+    try {
+      const obsidianGit = this.app.plugins?.getPlugin("obsidian-git");
+      if (!obsidianGit) return;
+
+      // Update the branch name shown in the status bar
+      await obsidianGit.branchBar?.display();
+
+      // Ask obsidian-git to do a full refresh (source-control view,
+      // cached status, etc.).
+      this.app.workspace.trigger("obsidian-git:refresh");
+
+      this.logToFile("DEBUG", "Triggered obsidian-git status refresh");
+    } catch (err) {
+      // Never let a cosmetic refresh break the main flow
+      this.logToFile("WARN", "Failed to refresh obsidian-git status", err);
+    }
+  }
+
+  // ── Git execution helper ────────────────────────────────────────────
+  // Prefer obsidian-git plugin's gitManager when available (handles
+  // credentials, SSH keys, GPG, etc.), otherwise fall back to direct CLI.
+  async runGit(args) {
+    const obsidianGit = this.app.plugins?.getPlugin("obsidian-git");
+    if (obsidianGit?.gitManager?.git) {
+      this.logToFile("DEBUG", `runGit via obsidian-git: git ${args.join(" ")}`);
+      const result = await obsidianGit.gitManager.git.raw(args);
+      return (result || "").trim();
+    }
+    // Fallback: shell out directly
+    const basePath = this.app.vault.adapter.getBasePath();
+    const cmd = "git " + args.join(" ");
+    this.logToFile("DEBUG", `runGit via CLI: ${cmd}`);
+    return execGit(cmd, basePath);
   }
 
   // ── Logging helper ─────────────────────────────────────────────────
@@ -175,12 +239,10 @@ class GitDeepLinkPlugin extends Plugin {
       return;
     }
 
-    const basePath = this.app.vault.adapter.getBasePath();
-
     // --- Detect whether the vault is backed by a Git repository ---
     let isGitRepo = false;
     try {
-      await execGit("git rev-parse --is-inside-work-tree", basePath);
+      await this.runGit(["rev-parse", "--is-inside-work-tree"]);
       isGitRepo = true;
     } catch (_) {
       isGitRepo = false;
@@ -196,25 +258,28 @@ class GitDeepLinkPlugin extends Plugin {
       try {
         // 1. Check for dirty working tree
         this.setStatus("🔗 Checking working tree…");
-        const status = await execGit("git status --porcelain", basePath);
+        const status = await this.runGit(["status", "--porcelain"]);
         if (status.length > 0) {
           const timestamp = new Date().toLocaleString();
           this.setStatus("🔗 Stashing changes…");
           new Notice("Git DeepLink: Working tree is dirty — stashing changes…", 5000);
-          await execGit(`git stash push -m "git-deeplink auto-stash ${timestamp}"`, basePath);
+          await this.runGit(["stash", "push", "-m", `git-deeplink auto-stash ${timestamp}`]);
         }
 
         // 2. Fetch latest from origin
         this.setStatus("🔗 Fetching from origin… (1/3)");
-        await execGit("git fetch origin", basePath);
+        await this.runGit(["fetch", "origin"]);
 
         // 3. Checkout target branch
         this.setStatus(`🔗 Checking out ${branch}… (2/3)`);
-        await execGit(`git checkout ${branch}`, basePath);
+        await this.runGit(["checkout", branch]);
 
         // 4. Pull latest changes
         this.setStatus(`🔗 Pulling ${branch}… (3/3)`);
-        await execGit(`git pull origin ${branch}`, basePath);
+        await this.runGit(["pull", "origin", branch]);
+
+        // Refresh obsidian-git so its status bar shows the new branch
+        await this.refreshObsidianGit();
       } catch (err) {
         this.clearStatus();
         this.logToFile("ERROR", "Git command failed during deep link flow", err);
@@ -256,11 +321,10 @@ class GitDeepLinkPlugin extends Plugin {
       return;
     }
 
-    const basePath = this.app.vault.adapter.getBasePath();
     let branch = null;
 
     try {
-      branch = await execGit("git rev-parse --abbrev-ref HEAD", basePath);
+      branch = await this.runGit(["rev-parse", "--abbrev-ref", "HEAD"]);
     } catch (_) {
       // Not a git repo — branch will remain null
       this.logToFile("INFO", "Vault is not a Git repository — generating link without branch");
@@ -312,89 +376,99 @@ class GitDeepLinkPlugin extends Plugin {
   //  Feature 3 — Interactive branch checkout from command palette
   // ════════════════════════════════════════════════════════════════════
   async checkoutBranchFromPalette() {
-    const basePath = this.app.vault.adapter.getBasePath();
-
     // 1. Verify this is a Git repository
     try {
-      await execGit("git rev-parse --is-inside-work-tree", basePath);
+      await this.runGit(["rev-parse", "--is-inside-work-tree"]);
     } catch (_) {
       new Notice("Git: This vault is not a Git repository.", 8000);
       return;
     }
 
-    // 2. Fetch all remotes so the list is up-to-date
-    this.setStatus("🌿 Fetching remotes…");
+    // 2. Collect local branches immediately (fast, no network)
+    let localItems = [];
     try {
-      await execGit("git fetch --all --prune", basePath);
+      const localRaw = await this.runGit(["branch", "--format=%(refname:short)"]);
+      const localBranches = localRaw.split("\n").map((b) => b.trim()).filter(Boolean);
+      localItems = localBranches.map((b) => ({ display: b, ref: b, type: "local" }));
     } catch (err) {
-      this.clearStatus();
-      this.logToFile("ERROR", "git fetch --all --prune failed", err);
-      new Notice(`Git: Failed to fetch remotes.\n${err}`, 8000);
-      return;
-    }
-
-    // 3. Collect local branches
-    let localRaw = "";
-    try {
-      localRaw = await execGit("git branch --format=%(refname:short)", basePath);
-    } catch (err) {
-      this.clearStatus();
       this.logToFile("ERROR", "Failed to list local branches", err);
       new Notice(`Git: Failed to list local branches.\n${err}`, 8000);
       return;
     }
 
-    // 4. Collect remote branches
-    let remoteRaw = "";
+    // Also grab cached remote branches (from the last fetch, no network call)
+    let cachedRemoteItems = [];
     try {
-      remoteRaw = await execGit("git branch -r --format=%(refname:short)", basePath);
+      const remoteRaw = await this.runGit(["branch", "-r", "--format=%(refname:strip=2)"]);
+      const localSet = new Set(localItems.map((i) => i.display));
+      cachedRemoteItems = remoteRaw
+        .split("\n")
+        .map((b) => b.trim())
+        .filter(Boolean)
+        .filter((b) => !b.endsWith("/HEAD"))
+        .filter((b) => !localSet.has(b.replace(/^[^/]+\//, "")))
+        .map((b) => ({ display: b, ref: b, type: "remote" }));
     } catch (err) {
-      this.clearStatus();
-      this.logToFile("ERROR", "Failed to list remote branches", err);
-      new Notice(`Git: Failed to list remote branches.\n${err}`, 8000);
-      return;
+      this.logToFile("WARN", "Failed to list cached remote branches", err);
     }
 
-    this.clearStatus();
+    // 3. Open the modal immediately with whatever we have
+    const modal = new BranchSuggestModal(
+      this.app,
+      [...localItems, ...cachedRemoteItems],
+      null // onChoose will be set via the promise below
+    );
 
-    const localBranches = localRaw
-      .split("\n")
-      .map((b) => b.trim())
-      .filter(Boolean);
-
-    const localSet = new Set(localBranches);
-
-    const remoteBranches = remoteRaw
-      .split("\n")
-      .map((b) => b.trim())
-      .filter(Boolean)
-      .filter((b) => !b.endsWith("/HEAD"));
-
-    const items = [];
-
-    // Add local branches
-    for (const b of localBranches) {
-      items.push({ display: b, ref: b, type: "local" });
-    }
-
-    // Add remote branches that don't already exist locally
-    for (const b of remoteBranches) {
-      // b is like "origin/feature-x"
-      const shortName = b.replace(/^[^/]+\//, ""); // strip remote prefix
-      if (!localSet.has(shortName)) {
-        items.push({ display: b, ref: b, type: "remote" });
-      }
-    }
-
-    if (items.length === 0) {
-      new Notice("Git: No branches found.", 5000);
-      return;
-    }
-
-    // 5. Open the fuzzy-search modal and wait for the user's choice
-    const chosen = await new Promise((resolve) => {
-      new BranchSuggestModal(this.app, items, resolve).open();
+    const chosenPromise = new Promise((resolve) => {
+      modal.onChoose = resolve;
     });
+
+    modal.open();
+
+    // 4. Fetch all remotes in the background and refresh the list
+    this.setStatus("🌿 Fetching remotes…");
+    (async () => {
+      try {
+        await this.runGit(["fetch", "--all", "--prune"]);
+
+        // Re-collect branches after fetch
+        const [freshLocalRaw, freshRemoteRaw] = await Promise.all([
+          this.runGit(["branch", "--format=%(refname:short)"]),
+          this.runGit(["branch", "-r", "--format=%(refname:strip=2)"]),
+        ]);
+
+        const freshLocalBranches = freshLocalRaw.split("\n").map((b) => b.trim()).filter(Boolean);
+        const freshLocalSet = new Set(freshLocalBranches);
+
+        const freshRemoteBranches = freshRemoteRaw
+          .split("\n")
+          .map((b) => b.trim())
+          .filter(Boolean)
+          .filter((b) => !b.endsWith("/HEAD"));
+
+        const freshItems = [];
+        for (const b of freshLocalBranches) {
+          freshItems.push({ display: b, ref: b, type: "local" });
+        }
+        for (const b of freshRemoteBranches) {
+          const shortName = b.replace(/^[^/]+\//, "");
+          if (!freshLocalSet.has(shortName)) {
+            freshItems.push({ display: b, ref: b, type: "remote" });
+          }
+        }
+
+        modal.updateBranches(freshItems, false);
+      } catch (err) {
+        this.logToFile("WARN", "Background fetch failed, keeping cached branch list", err);
+        // Mark loading as done even if fetch failed — the cached list is still usable
+        modal.updateBranches(modal.branches, false);
+      } finally {
+        this.clearStatus();
+      }
+    })();
+
+    // 5. Wait for the user's choice
+    const chosen = await chosenPromise;
 
     if (!chosen) {
       // User dismissed the modal
@@ -405,15 +479,18 @@ class GitDeepLinkPlugin extends Plugin {
     this.setStatus(`🌿 Checking out ${chosen.display}…`);
     try {
       if (chosen.type === "local") {
-        await execGit(`git checkout ${chosen.ref}`, basePath);
+        await this.runGit(["checkout", chosen.ref]);
       } else {
         // Remote branch → create a local tracking branch
         const localName = chosen.ref.replace(/^[^/]+\//, "");
-        await execGit(`git checkout -b ${localName} ${chosen.ref}`, basePath);
+        await this.runGit(["checkout", "-b", localName, chosen.ref]);
       }
       this.clearStatus();
       new Notice(`Git: Switched to ${chosen.display}`, 4000);
       this.logToFile("INFO", `Checked out branch: ${chosen.display} (${chosen.type})`);
+
+      // Refresh obsidian-git so its status bar shows the new branch
+      await this.refreshObsidianGit();
     } catch (err) {
       this.clearStatus();
       this.logToFile("ERROR", `Checkout failed for ${chosen.display}`, err);
