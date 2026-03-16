@@ -1,4 +1,4 @@
-const { Plugin, Notice, FuzzySuggestModal } = require("obsidian");
+const { Plugin, Notice } = require("obsidian");
 const { exec } = require("child_process");
 const fs = require("fs");
 const path = require("path");
@@ -39,39 +39,6 @@ function waitForFile(app, filePath, intervalMs = 300, timeoutMs = 5000) {
   });
 }
 
-// ══════════════════════════════════════════════════════════════════════
-//  Branch picker modal (fuzzy-searchable list)
-// ══════════════════════════════════════════════════════════════════════
-class BranchSuggestModal extends FuzzySuggestModal {
-  constructor(app, branches, onChoose) {
-    super(app);
-    this.branches = branches;
-    this.onChoose = onChoose;
-    this.resolved = false;
-    this.setPlaceholder("Type to search branches…");
-  }
-
-  getItems() {
-    return this.branches;
-  }
-
-  getItemText(item) {
-    return `${item.display}  [${item.type}]`;
-  }
-
-  onChooseItem(item) {
-    this.resolved = true;
-    this.onChoose(item);
-  }
-
-  onClose() {
-    // If the user dismissed without picking, resolve with null
-    if (!this.resolved) {
-      this.onChoose(null);
-    }
-  }
-}
-
 class GitDeepLinkPlugin extends Plugin {
   onload() {
     // ── Status bar item for progress feedback ─────────────────────────
@@ -105,15 +72,6 @@ class GitDeepLinkPlugin extends Plugin {
         });
       })
     );
-
-    // ── Feature 3: "Git: Checkout branch" command ──────────────────────
-    this.addCommand({
-      id: "git-checkout-branch",
-      name: "Git: Checkout branch",
-      callback: async () => {
-        await this.checkoutBranchFromPalette();
-      },
-    });
   }
 
   // ── Status bar helpers ──────────────────────────────────────────────
@@ -305,119 +263,6 @@ class GitDeepLinkPlugin extends Plugin {
     } catch (err) {
       this.logToFile("ERROR", "Failed to copy to clipboard", err);
       new Notice(`Git DeepLink: Failed to copy to clipboard.\n${err}`, 8000);
-    }
-  }
-
-  // ════════════════════════════════════════════════════════════════════
-  //  Feature 3 — Interactive branch checkout from command palette
-  // ════════════════════════════════════════════════════════════════════
-  async checkoutBranchFromPalette() {
-    const basePath = this.app.vault.adapter.getBasePath();
-
-    // 1. Verify this is a Git repository
-    try {
-      await execGit("git rev-parse --is-inside-work-tree", basePath);
-    } catch (_) {
-      new Notice("Git: This vault is not a Git repository.", 8000);
-      return;
-    }
-
-    // 2. Fetch all remotes so the list is up-to-date
-    this.setStatus("🌿 Fetching remotes…");
-    try {
-      await execGit("git fetch --all --prune", basePath);
-    } catch (err) {
-      this.clearStatus();
-      this.logToFile("ERROR", "git fetch --all --prune failed", err);
-      new Notice(`Git: Failed to fetch remotes.\n${err}`, 8000);
-      return;
-    }
-
-    // 3. Collect local branches
-    let localRaw = "";
-    try {
-      localRaw = await execGit("git branch --format=%(refname:short)", basePath);
-    } catch (err) {
-      this.clearStatus();
-      this.logToFile("ERROR", "Failed to list local branches", err);
-      new Notice(`Git: Failed to list local branches.\n${err}`, 8000);
-      return;
-    }
-
-    // 4. Collect remote branches
-    let remoteRaw = "";
-    try {
-      remoteRaw = await execGit("git branch -r --format=%(refname:short)", basePath);
-    } catch (err) {
-      this.clearStatus();
-      this.logToFile("ERROR", "Failed to list remote branches", err);
-      new Notice(`Git: Failed to list remote branches.\n${err}`, 8000);
-      return;
-    }
-
-    this.clearStatus();
-
-    const localBranches = localRaw
-      .split("\n")
-      .map((b) => b.trim())
-      .filter(Boolean);
-
-    const localSet = new Set(localBranches);
-
-    const remoteBranches = remoteRaw
-      .split("\n")
-      .map((b) => b.trim())
-      .filter(Boolean)
-      .filter((b) => !b.endsWith("/HEAD"));
-
-    const items = [];
-
-    // Add local branches
-    for (const b of localBranches) {
-      items.push({ display: b, ref: b, type: "local" });
-    }
-
-    // Add remote branches that don't already exist locally
-    for (const b of remoteBranches) {
-      // b is like "origin/feature-x"
-      const shortName = b.replace(/^[^/]+\//, ""); // strip remote prefix
-      if (!localSet.has(shortName)) {
-        items.push({ display: b, ref: b, type: "remote" });
-      }
-    }
-
-    if (items.length === 0) {
-      new Notice("Git: No branches found.", 5000);
-      return;
-    }
-
-    // 5. Open the fuzzy-search modal and wait for the user's choice
-    const chosen = await new Promise((resolve) => {
-      new BranchSuggestModal(this.app, items, resolve).open();
-    });
-
-    if (!chosen) {
-      // User dismissed the modal
-      return;
-    }
-
-    // 6. Checkout the selected branch
-    this.setStatus(`🌿 Checking out ${chosen.display}…`);
-    try {
-      if (chosen.type === "local") {
-        await execGit(`git checkout ${chosen.ref}`, basePath);
-      } else {
-        // Remote branch → create a local tracking branch
-        const localName = chosen.ref.replace(/^[^/]+\//, "");
-        await execGit(`git checkout -b ${localName} ${chosen.ref}`, basePath);
-      }
-      this.clearStatus();
-      new Notice(`Git: Switched to ${chosen.display}`, 4000);
-      this.logToFile("INFO", `Checked out branch: ${chosen.display} (${chosen.type})`);
-    } catch (err) {
-      this.clearStatus();
-      this.logToFile("ERROR", `Checkout failed for ${chosen.display}`, err);
-      new Notice(`Git: Checkout failed.\n${err}`, 10000);
     }
   }
 }
