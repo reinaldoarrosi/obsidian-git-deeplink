@@ -270,27 +270,6 @@ class GitDeepLinkPlugin extends Plugin {
       this.logToFile("INFO", "Vault is not a Git repository — generating link without branch");
     }
 
-    // --- Determine anchor (heading or block ID) ---
-    const cursor = editor.getCursor();
-    const currentLineText = editor.getLine(cursor.line);
-    let anchor = "";
-
-    // Check if the current line has a block ID (e.g. ^task-123)
-    const blockIdMatch = currentLineText.match(/\^([\w-]+)\s*$/);
-    if (blockIdMatch) {
-      anchor = "^" + blockIdMatch[1];
-    } else {
-      // Walk upward to find the nearest heading
-      for (let i = cursor.line; i >= 0; i--) {
-        const line = editor.getLine(i);
-        const headingMatch = line.match(/^#{1,6}\s+(.+)/);
-        if (headingMatch) {
-          anchor = headingMatch[1].trim();
-          break;
-        }
-      }
-    }
-
     // --- Build the URL ---
     const vaultName = this.app.vault.getName();
     const filePath = file.path;
@@ -299,8 +278,7 @@ class GitDeepLinkPlugin extends Plugin {
       `obsidian://git-deeplink` +
       `?vault=${encodeURIComponent(vaultName)}` +
       (branch ? `&branch=${encodeURIComponent(branch)}` : "") +
-      `&file=${encodeURIComponent(filePath)}` +
-      (anchor ? `&anchor=${encodeURIComponent(anchor)}` : "");
+      `&file=${encodeURIComponent(filePath)}`;
 
     // --- Copy to clipboard ---
     try {
