@@ -206,9 +206,16 @@ class GitDeepLinkPlugin extends Plugin {
         this.setStatus("🔗 Fetching from origin… (1/3)");
         await this.runGit(["fetch", "origin"]);
 
-        // 3. Checkout target branch
+        // 3. Checkout target branch (create local tracking branch if it doesn't exist)
         this.setStatus(`🔗 Checking out ${branch}… (2/3)`);
-        await this.runGit(["checkout", branch]);
+        const branchExistsLocally = await this.runGit(["rev-parse", "--verify", `refs/heads/${branch}`])
+          .then(() => true)
+          .catch(() => false);
+        if (branchExistsLocally) {
+          await this.runGit(["checkout", branch]);
+        } else {
+          await this.runGit(["checkout", "-b", branch, `origin/${branch}`]);
+        }
 
         // 4. Pull latest changes
         this.setStatus(`🔗 Pulling ${branch}… (3/3)`);
