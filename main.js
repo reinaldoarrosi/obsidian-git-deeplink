@@ -107,6 +107,48 @@ class GitDeepLinkPlugin extends Plugin {
     }
   }
 
+  // ── Refresh obsidian-git status after branch changes ───────────────
+  // obsidian-git only updates its branch status bar in response to its
+  // own operations.  After we checkout a branch externally we need to
+  // poke it so the UI stays in sync.
+  async refreshObsidianGit() {
+    try {
+      const obsidianGit = this.app.plugins?.getPlugin("obsidian-git");
+      if (!obsidianGit) return;
+
+      // Update the branch name shown in the status bar
+      await obsidianGit.branchBar?.display();
+
+      // Ask obsidian-git to do a full refresh (source-control view,
+      // cached status, etc.).
+      this.app.workspace.trigger("obsidian-git:refresh");
+
+      this.logToFile("DEBUG", "Triggered obsidian-git status refresh");
+    } catch (err) {
+      // Never let a cosmetic refresh break the main flow
+      this.logToFile("WARN", "Failed to refresh obsidian-git status", err);
+    }
+  }
+
+  // ── Git execution helper ────────────────────────────────────────────
+  // Prefer obsidian-git plugin's gitManager when available (handles
+  // credentials, SSH keys, GPG, etc.), otherwise fall back to direct CLI.
+  async runGit(args) {
+    const obsidianGit = this.app.plugins?.getPlugin("obsidian-git");
+    
+    if (obsidianGit?.gitManager?.git) {
+      this.logToFile("DEBUG", `runGit via obsidian-git: git ${args.join(" ")}`);
+      const result = await obsidianGit.gitManager.git.raw(args);
+      return (result || "").trim();
+    }
+
+    // Fallback: shell out directly
+    const basePath = this.app.vault.adapter.getBasePath();
+    const cmd = "git " + args.join(" ");
+    this.logToFile("DEBUG", `runGit via CLI: ${cmd}`);
+    return execGit(cmd, basePath);
+  }
+
   // ════════════════════════════════════════════════════════════════════
   //  Feature 1 — Handle incoming obsidian://git-deeplink?… URIs
   // ════════════════════════════════════════════════════════════════════
@@ -133,12 +175,10 @@ class GitDeepLinkPlugin extends Plugin {
       return;
     }
 
-    const basePath = this.app.vault.adapter.getBasePath();
-
     // --- Detect whether the vault is backed by a Git repository ---
     let isGitRepo = false;
     try {
-      await execGit("git rev-parse --is-inside-work-tree", basePath);
+      await this.runGit(["rev-parse", "--is-inside-work-tree"]);
       isGitRepo = true;
     } catch (_) {
       isGitRepo = false;
@@ -154,25 +194,25 @@ class GitDeepLinkPlugin extends Plugin {
       try {
         // 1. Check for dirty working tree
         this.setStatus("🔗 Checking working tree…");
-        const status = await execGit("git status --porcelain", basePath);
+        const status = await this.runGit(["status", "--porcelain"]);
         if (status.length > 0) {
           const timestamp = new Date().toLocaleString();
           this.setStatus("🔗 Stashing changes…");
           new Notice("Git DeepLink: Working tree is dirty — stashing changes…", 5000);
-          await execGit(`git stash push -m "git-deeplink auto-stash ${timestamp}"`, basePath);
+          await this.runGit(["stash", "push", "-m", `git-deeplink auto-stash ${timestamp}`]);
         }
 
         // 2. Fetch latest from origin
         this.setStatus("🔗 Fetching from origin… (1/3)");
-        await execGit("git fetch origin", basePath);
+        await this.runGit(["fetch", "origin"]);
 
         // 3. Checkout target branch
         this.setStatus(`🔗 Checking out ${branch}… (2/3)`);
-        await execGit(`git checkout ${branch}`, basePath);
+        await this.runGit(["checkout", branch]);
 
         // 4. Pull latest changes
         this.setStatus(`🔗 Pulling ${branch}… (3/3)`);
-        await execGit(`git pull origin ${branch}`, basePath);
+        await this.runGit(["pull", "origin", branch]);
       } catch (err) {
         this.clearStatus();
         this.logToFile("ERROR", "Git command failed during deep link flow", err);
@@ -214,11 +254,10 @@ class GitDeepLinkPlugin extends Plugin {
       return;
     }
 
-    const basePath = this.app.vault.adapter.getBasePath();
     let branch = null;
 
     try {
-      branch = await execGit("git rev-parse --abbrev-ref HEAD", basePath);
+      branch = await this.runGit(["rev-parse", "--abbrev-ref", "HEAD"]);
     } catch (_) {
       // Not a git repo — branch will remain null
       this.logToFile("INFO", "Vault is not a Git repository — generating link without branch");
